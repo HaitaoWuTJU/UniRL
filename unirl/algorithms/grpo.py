@@ -35,22 +35,13 @@ class GRPOConfig(BaseAlgorithmConfig):
 class GRPO(StageAlgorithm):
     """GRPO over an AR ``TextSegment`` via ``ARStage.replay``."""
 
-    # old_logp is frozen on the segment and does NOT change across mini-batch
-    # updates, so reusing it across num_updates_per_batch>1 keeps the ratio
-    # anchored. Under the default old_logp_source='rollout' the anchor is the
-    # rollout (SGLang) log-prob — the deliberate rollout-anchored PPO ratio
-    # (verl bypass_mode=True parity), matching DRPO — and the ratio absorbs the
-    # rollout-vs-train engine gap on later mini-batches (accepted for parity).
-    # Under 'replay' prepare_segment overwrites it with a train-side anchor.
+    # Freeze π_old across updates, sourced from rollout or train-side replay.
     supports_multi_update = True
-    # ``rollout_log_probs`` rides along so the rollout_replay_* / k3_* gauges
-    # keep comparing against the engine's emission after ``replay`` overwrites
-    # ``log_probs`` (mirrors GSPO); the stack writes both back per micro.
+    # Preserve rollout values separately so engine-drift metrics remain valid.
     anchor_fields = ("log_probs", "rollout_log_probs")
 
     @property
     def recomputes_anchor(self) -> bool:
-        # Only ``replay`` re-derives log_probs; ``rollout`` keeps the engine's emission.
         return self.old_logp_source == "replay"
 
     def __init__(
