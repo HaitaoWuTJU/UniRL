@@ -16,6 +16,7 @@ from .base import (
     BaseAlgorithmConfig,
     StageAlgorithm,
     _grpo_clip_loss,
+    _prepare_ar_logp_anchor,
     _resolve_clip_range_from_schedule,
     rollout_replay_k3,
     rollout_replay_logp_absdiff,
@@ -89,24 +90,14 @@ class GRPO(StageAlgorithm):
         segment: "TextSegment",
     ) -> None:
         """Freeze the selected rollout- or replay-sourced old-policy anchor."""
-        if segment.tokens is None or segment.log_probs is None or int(segment.tokens.shape[0]) == 0:
-            return
-        # Snapshot the engine's emission before anything can overwrite it. Most
-        # AR producers (qwen3 / qwen_vl trainside, the SGLang text adapter) pack
-        # only ``log_probs``; without this, ``replay`` would leave the
-        # rollout-vs-replay metrics comparing new_logp against the train-side
-        # anchor (~0 on the first update) instead of the rollout value.
-        if segment.rollout_log_probs is None:
-            segment.rollout_log_probs = segment.log_probs.detach().cpu().clone()
-        if self.old_logp_source != "replay":
-            return
-        typed_conds = typed_conditions(conditions, self.conditions_cls)
-        with torch.no_grad():
-            frozen = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
-        # Keep the replay's native (fp32) precision — do NOT downcast to whatever
-        # dtype the engine emitted, so the anchor stays as close as possible to
-        # new_logp's fp32 replay (mirrors FlowGRPO / DRPO).
-        segment.log_probs = frozen.detach().cpu()
+        _prepare_ar_logp_anchor(
+            stage=self.stage,
+            conditions=conditions,
+            segment=segment,
+            conditions_cls=self.conditions_cls,
+            old_logp_source=self.old_logp_source,
+            sampling_temperature=self.sampling_temperature,
+        )
 
     def compute_loss_and_backward(
         self,
