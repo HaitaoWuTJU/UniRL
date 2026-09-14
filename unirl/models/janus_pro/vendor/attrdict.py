@@ -1,3 +1,6 @@
+"""Minimal AttrDict subset used by the pinned Janus-Pro checkpoint configs."""
+
+
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

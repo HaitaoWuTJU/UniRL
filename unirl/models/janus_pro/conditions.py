@@ -20,61 +20,45 @@ def _finite_cfg_weight(value: Any, *, where: str) -> float:
     return normalized
 
 
-def _pad_seq_tensor(value: Optional[torch.Tensor], target_seq_len: int) -> Optional[torch.Tensor]:
-    if value is None:
-        return None
-    if value.dim() < 2 or int(value.shape[1]) == target_seq_len:
+def _pad_seq_tensor(value: torch.Tensor, target_seq_len: int) -> torch.Tensor:
+    if value.dim() != 2:
+        raise ValueError(f"Janus-Pro sequence tensors must be rank 2, got shape={tuple(value.shape)}.")
+    if value.shape[1] == target_seq_len:
         return value
-    if int(value.shape[1]) > target_seq_len:
+    if value.shape[1] > target_seq_len:
         raise ValueError(
             f"Cannot pad Janus-Pro sequence tensor with seq_len={value.shape[1]} to shorter target={target_seq_len}"
         )
     target_shape = list(value.shape)
-    target_shape[1] = int(target_seq_len)
+    target_shape[1] = target_seq_len
     out = value.new_zeros(target_shape)
-    out[:, : int(value.shape[1]), ...] = value
+    out[:, : value.shape[1], ...] = value
     return out
 
 
-def _cat_optional_tensors(values: Sequence[Optional[torch.Tensor]], *, field_name: str) -> Optional[torch.Tensor]:
-    if all(v is None for v in values):
-        return None
-    if any(v is None for v in values):
-        raise ValueError(f"JanusProARConditions.concat: mixed None/tensor values for {field_name}")
-    return torch.cat([v for v in values if v is not None], dim=0)
-
-
-def _stack_seq_rows(value: Any, target_seq_len: Optional[int]) -> Optional[torch.Tensor]:
-    if value is None:
-        return None
+def _stack_seq_rows(value: Any, target_seq_len: int) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
-        return _pad_seq_tensor(value, target_seq_len) if target_seq_len is not None else value
+        return _pad_seq_tensor(value, target_seq_len)
     if not isinstance(value, (list, tuple)):
         raise TypeError(f"JanusProARConditions: expected images_seq_mask tensor/list, got {type(value).__name__}")
 
-    rows = [row for row in value if row is not None]
-    if len(rows) != len(value):
-        raise ValueError("JanusProARConditions: mixed None/tensor values for images_seq_mask")
+    rows = list(value)
     if not rows:
-        if target_seq_len is None:
-            target_seq_len = 0
-        return torch.empty((0, int(target_seq_len)), dtype=torch.bool)
-
-    if target_seq_len is None:
-        target_seq_len = max(int(row.reshape(-1).shape[0]) for row in rows)
+        return torch.empty((0, target_seq_len), dtype=torch.bool)
+    if any(not isinstance(row, torch.Tensor) for row in rows):
+        bad = next(row for row in rows if not isinstance(row, torch.Tensor))
+        raise TypeError(f"JanusProARConditions: images_seq_mask row must be tensor, got {type(bad).__name__}")
 
     padded = []
     for row in rows:
-        if not isinstance(row, torch.Tensor):
-            raise TypeError(f"JanusProARConditions: images_seq_mask row must be tensor, got {type(row).__name__}")
         flat = row.reshape(-1)
-        if int(flat.shape[0]) > int(target_seq_len):
+        if flat.shape[0] > target_seq_len:
             raise ValueError(
                 f"Cannot pad Janus-Pro images_seq_mask row with seq_len={flat.shape[0]} "
                 f"to shorter target={target_seq_len}"
             )
-        out = flat.new_zeros((int(target_seq_len),))
-        out[: int(flat.shape[0])] = flat
+        out = flat.new_zeros((target_seq_len,))
+        out[: flat.shape[0]] = flat
         padded.append(out)
     return torch.stack(padded, dim=0)
 
@@ -89,103 +73,84 @@ def _require_tensor(d: Dict[str, Any], key: str) -> torch.Tensor:
     return value
 
 
+def _optional_tensor(d: Dict[str, Any], key: str) -> Optional[torch.Tensor]:
+    value = d.get(key)
+    if value is not None and not isinstance(value, torch.Tensor):
+        raise TypeError(f"Janus-Pro conditions require d[{key!r}] to be a tensor or None.")
+    return value
+
+
+def _require_text_condition(d: Dict[str, Any], key: str) -> TextTokenCondition:
+    value = d.get(key)
+    if not isinstance(value, TextTokenCondition):
+        raise TypeError(
+            f"Janus-Pro conditions require d[{key!r}] to be a TextTokenCondition, "
+            f"got {type(value).__name__ if value is not None else 'None'}"
+        )
+    return value
+
+
+def _prompt_seq_len(prompt: TextTokenCondition) -> int:
+    for value in (prompt.input_ids, prompt.attention_mask):
+        if value is not None:
+            if value.dim() != 2:
+                raise ValueError(f"Janus-Pro prompt tensors must be rank 2, got shape={tuple(value.shape)}.")
+            return value.shape[1]
+    raise ValueError("Janus-Pro prompt requires input_ids or attention_mask.")
+
+
 @dataclass
 class JanusProARConditions(Batch):
-    """Batched prompt, pixels, and image masks for Janus-Pro understanding."""
+    """Batched prompt and cached-or-raw image conditioning for Janus-Pro."""
 
-    prompt: Optional[TextTokenCondition] = field(kind=FieldKind.CONCAT, default=None)
+    prompt: TextTokenCondition = field(kind=FieldKind.CONCAT)
+    images_seq_mask: torch.Tensor = field(kind=FieldKind.CONCAT)
+    images_emb_mask: torch.Tensor = field(kind=FieldKind.CONCAT)
     pixel_values: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
-    images_seq_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
-    images_emb_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
+    image_embeds: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
+
+    def __post_init__(self) -> None:
+        if (self.pixel_values is None) == (self.image_embeds is None):
+            raise ValueError("JanusProARConditions requires exactly one of pixel_values or image_embeds.")
 
     @classmethod
     def concat(cls, items: Sequence["JanusProARConditions"]) -> "JanusProARConditions":
         if not items or len(items) == 1:
             return Batch.concat.__func__(cls, items)
 
-        prompts = [item.prompt for item in items]
-        if any(not isinstance(prompt, TextTokenCondition) for prompt in prompts):
-            return Batch.concat.__func__(cls, items)
-
-        prompt = TextTokenCondition.concat([prompt for prompt in prompts if prompt is not None])
-        target_seq_len = None
-        if prompt.input_ids is not None and prompt.input_ids.dim() >= 2:
-            target_seq_len = int(prompt.input_ids.shape[1])
-        elif prompt.attention_mask is not None and prompt.attention_mask.dim() >= 2:
-            target_seq_len = int(prompt.attention_mask.shape[1])
-
-        images_seq_masks = [item.images_seq_mask for item in items]
-        if target_seq_len is not None:
-            images_seq_masks = [_pad_seq_tensor(mask, target_seq_len) for mask in images_seq_masks]
+        prompt = TextTokenCondition.concat([item.prompt for item in items])
+        target_seq_len = _prompt_seq_len(prompt)
+        images_seq_masks = [_pad_seq_tensor(item.images_seq_mask, target_seq_len) for item in items]
+        cached = items[0].image_embeds is not None
+        if any((item.image_embeds is not None) != cached for item in items[1:]):
+            raise ValueError("JanusProARConditions.concat cannot mix pixels and cached image embeddings.")
 
         return cls(
             prompt=prompt,
-            pixel_values=_cat_optional_tensors([item.pixel_values for item in items], field_name="pixel_values"),
-            images_seq_mask=_cat_optional_tensors(images_seq_masks, field_name="images_seq_mask"),
-            images_emb_mask=_cat_optional_tensors(
-                [item.images_emb_mask for item in items],
-                field_name="images_emb_mask",
-            ),
+            images_seq_mask=torch.cat(images_seq_masks, dim=0),
+            images_emb_mask=torch.cat([item.images_emb_mask for item in items], dim=0),
+            pixel_values=None if cached else torch.cat([item.pixel_values for item in items], dim=0),
+            image_embeds=torch.cat([item.image_embeds for item in items], dim=0) if cached else None,
         )
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "JanusProARConditions":
-        prompt = d.get("prompt")
-        if not isinstance(prompt, TextTokenCondition):
-            raise TypeError(
-                "JanusProARConditions.from_dict: expected d['prompt'] to be a "
-                f"TextTokenCondition, got {type(prompt).__name__ if prompt is not None else 'None'}"
-            )
-        target_seq_len = None
-        if prompt.input_ids is not None and prompt.input_ids.dim() >= 2:
-            target_seq_len = int(prompt.input_ids.shape[1])
-        elif prompt.attention_mask is not None and prompt.attention_mask.dim() >= 2:
-            target_seq_len = int(prompt.attention_mask.shape[1])
-        pixel_values = _require_tensor(d, "pixel_values")
-        images_emb_mask = _require_tensor(d, "images_emb_mask")
+        prompt = _require_text_condition(d, "prompt")
         return cls(
             prompt=prompt,
-            pixel_values=pixel_values,
-            images_seq_mask=_stack_seq_rows(d.get("images_seq_mask"), target_seq_len),
-            images_emb_mask=images_emb_mask,
+            images_seq_mask=_stack_seq_rows(d["images_seq_mask"], _prompt_seq_len(prompt)),
+            images_emb_mask=_require_tensor(d, "images_emb_mask"),
+            pixel_values=_optional_tensor(d, "pixel_values"),
+            image_embeds=_optional_tensor(d, "image_embeds"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        if self.prompt is None:
-            raise ValueError("JanusProARConditions.to_dict: prompt field is None")
-        if not isinstance(self.prompt, TextTokenCondition):
-            raise TypeError(
-                f"JanusProARConditions.to_dict: prompt must be TextTokenCondition, got {type(self.prompt).__name__}"
-            )
-        if self.pixel_values is None:
-            raise ValueError("JanusProARConditions.to_dict: pixel_values field is None")
-        if not isinstance(self.pixel_values, torch.Tensor):
-            raise TypeError(
-                "JanusProARConditions.to_dict: pixel_values must be torch.Tensor, "
-                f"got {type(self.pixel_values).__name__}"
-            )
-        if self.images_seq_mask is None:
-            raise ValueError("JanusProARConditions.to_dict: images_seq_mask field is None")
-        if not isinstance(self.images_seq_mask, torch.Tensor):
-            raise TypeError(
-                "JanusProARConditions.to_dict: images_seq_mask must be torch.Tensor, "
-                f"got {type(self.images_seq_mask).__name__}"
-            )
-        if self.images_emb_mask is None:
-            raise ValueError("JanusProARConditions.to_dict: images_emb_mask field is None")
-        if not isinstance(self.images_emb_mask, torch.Tensor):
-            raise TypeError(
-                "JanusProARConditions.to_dict: images_emb_mask must be torch.Tensor, "
-                f"got {type(self.images_emb_mask).__name__}"
-            )
-        images_seq_mask: Any = self.images_seq_mask
-        if isinstance(images_seq_mask, torch.Tensor):
-            images_seq_mask = [images_seq_mask[i].clone() for i in range(int(images_seq_mask.shape[0]))]
         return {
             "prompt": self.prompt,
             "pixel_values": self.pixel_values,
-            "images_seq_mask": images_seq_mask,
+            "images_seq_mask": [row.clone() for row in self.images_seq_mask],
             "images_emb_mask": self.images_emb_mask,
+            "image_embeds": self.image_embeds,
         }
 
 
@@ -194,8 +159,8 @@ class JanusProImageARConditions(Batch):
     """Conditions for Janus-Pro Text -> Image autoregressive token generation."""
 
     cfg_weight: float = field(kind=FieldKind.SHARED)
-    prompt: Optional[TextTokenCondition] = field(kind=FieldKind.CONCAT, default=None)
-    cfg_prompt: Optional[TextTokenCondition] = field(kind=FieldKind.CONCAT, default=None)
+    prompt: TextTokenCondition = field(kind=FieldKind.CONCAT)
+    cfg_prompt: TextTokenCondition = field(kind=FieldKind.CONCAT)
 
     def __post_init__(self) -> None:
         self.cfg_weight = _finite_cfg_weight(
@@ -208,37 +173,20 @@ class JanusProImageARConditions(Batch):
         if not items or len(items) == 1:
             return Batch.concat.__func__(cls, items)
 
-        prompts = [item.prompt for item in items]
-        cfg_prompts = [item.cfg_prompt for item in items]
-        if any(not isinstance(prompt, TextTokenCondition) for prompt in prompts):
-            return Batch.concat.__func__(cls, items)
-        if any(not isinstance(prompt, TextTokenCondition) for prompt in cfg_prompts):
-            return Batch.concat.__func__(cls, items)
-
         cfg_weight = items[0].cfg_weight
         if any(item.cfg_weight != cfg_weight for item in items[1:]):
             raise ValueError("JanusProImageARConditions.concat requires one shared cfg_weight.")
 
         return cls(
-            prompt=TextTokenCondition.concat([prompt for prompt in prompts if prompt is not None]),
-            cfg_prompt=TextTokenCondition.concat([prompt for prompt in cfg_prompts if prompt is not None]),
+            prompt=TextTokenCondition.concat([item.prompt for item in items]),
+            cfg_prompt=TextTokenCondition.concat([item.cfg_prompt for item in items]),
             cfg_weight=cfg_weight,
         )
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "JanusProImageARConditions":
-        prompt = d.get("prompt")
-        if not isinstance(prompt, TextTokenCondition):
-            raise TypeError(
-                "JanusProImageARConditions.from_dict: expected d['prompt'] to be a "
-                f"TextTokenCondition, got {type(prompt).__name__ if prompt is not None else 'None'}"
-            )
-        cfg_prompt = d.get("cfg_prompt")
-        if not isinstance(cfg_prompt, TextTokenCondition):
-            raise TypeError(
-                "JanusProImageARConditions.from_dict: expected d['cfg_prompt'] to be a "
-                f"TextTokenCondition, got {type(cfg_prompt).__name__ if cfg_prompt is not None else 'None'}"
-            )
+        prompt = _require_text_condition(d, "prompt")
+        cfg_prompt = _require_text_condition(d, "cfg_prompt")
         return cls(
             prompt=prompt,
             cfg_prompt=cfg_prompt,
@@ -246,20 +194,6 @@ class JanusProImageARConditions(Batch):
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        if self.prompt is None:
-            raise ValueError("JanusProImageARConditions.to_dict: prompt field is None")
-        if not isinstance(self.prompt, TextTokenCondition):
-            raise TypeError(
-                "JanusProImageARConditions.to_dict: prompt must be TextTokenCondition, "
-                f"got {type(self.prompt).__name__}"
-            )
-        if self.cfg_prompt is None:
-            raise ValueError("JanusProImageARConditions.to_dict: cfg_prompt field is None")
-        if not isinstance(self.cfg_prompt, TextTokenCondition):
-            raise TypeError(
-                "JanusProImageARConditions.to_dict: cfg_prompt must be TextTokenCondition, "
-                f"got {type(self.cfg_prompt).__name__}"
-            )
         return {
             "prompt": self.prompt,
             "cfg_prompt": self.cfg_prompt,

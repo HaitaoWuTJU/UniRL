@@ -18,6 +18,7 @@
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 from dataclasses import field
+from typing import Optional
 
 import torch
 from unirl.models.janus_pro.vendor.attrdict import AttrDict
@@ -222,12 +223,22 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         language_config = config.language_config
         self.language_model = LlamaForCausalLM(language_config)
 
+    def prepare_image_embeds(self, pixel_values: torch.FloatTensor):
+        bs, n = pixel_values.shape[0:2]
+        images = rearrange(pixel_values, "b n c h w -> (b n) c h w")
+        # [b x n, T2, D]
+        images_embeds = self.aligner(self.vision_model(images))
+
+        # [b x n, T2, D] -> [b, n x T2, D]
+        return rearrange(images_embeds, "(b n) t d -> b (n t) d", b=bs, n=n)
+
     def prepare_inputs_embeds(
         self,
         input_ids: torch.LongTensor,
-        pixel_values: torch.FloatTensor,
+        pixel_values: Optional[torch.FloatTensor],
         images_seq_mask: torch.LongTensor,
         images_emb_mask: torch.LongTensor,
+        images_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ):
         """
@@ -244,13 +255,11 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
             input_embeds (torch.Tensor): [b, T, D]
         """
 
-        bs, n = pixel_values.shape[0:2]
-        images = rearrange(pixel_values, "b n c h w -> (b n) c h w")
-        # [b x n, T2, D]
-        images_embeds = self.aligner(self.vision_model(images))
+        if (pixel_values is None) == (images_embeds is None):
+            raise ValueError("prepare_inputs_embeds requires exactly one of pixel_values or images_embeds.")
+        if images_embeds is None:
+            images_embeds = self.prepare_image_embeds(pixel_values)
 
-        # [b x n, T2, D] -> [b, n x T2, D]
-        images_embeds = rearrange(images_embeds, "(b n) t d -> b (n t) d", b=bs, n=n)
         # [b, n, T2] -> [b, n x T2]
         images_emb_mask = rearrange(images_emb_mask, "b n t -> b (n t)")
 
@@ -259,9 +268,10 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
 
         # replace with the image embeddings
-        # MIGRATION grad-safety edit: replay backprop cannot write inplace into
-        # the embedding op output directly on torch 2.11 / transformers 5.x.
-        inputs_embeds = inputs_embeds.clone()
+        # MIGRATION grad-safety edit: clone only when the embedding output carries
+        # grad; frozen embeddings and no-grad rollout can update it in place.
+        if inputs_embeds.requires_grad:
+            inputs_embeds = inputs_embeds.clone()
         inputs_embeds[images_seq_mask] = images_embeds[images_emb_mask]
 
         return inputs_embeds

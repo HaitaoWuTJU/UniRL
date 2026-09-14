@@ -26,6 +26,9 @@ class JanusProBundle(Bundle):
         dtype: torch.dtype,
         device: torch.device,
         pretrained_path: str,
+        pad_token_id: int,
+        cache_vision_embeddings: bool,
+        rollout_keep_params_unsharded: bool,
     ) -> None:
         super().__init__()
         self.model = model
@@ -37,20 +40,16 @@ class JanusProBundle(Bundle):
         self.dtype = dtype
         self.device = device
         self.pretrained_path = pretrained_path
+        self.pad_token_id = pad_token_id
+        self.cache_vision_embeddings = cache_vision_embeddings
+        self.rollout_keep_params_unsharded = rollout_keep_params_unsharded
 
     @classmethod
     def from_config(cls, config: JanusProPipelineConfig) -> "JanusProBundle":
-        try:
-            # Importing the vendored package is also what registers
-            # MultiModalityCausalLM with AutoModelForCausalLM below.
-            from .vendor.models import MultiModalityCausalLM, VLChatProcessor
-        except ImportError as exc:
-            raise ImportError(
-                "JanusProBundle requires the vendored DeepSeek Janus code under "
-                "unirl.models.janus_pro.vendor and its runtime dependencies."
-            ) from exc
-
+        # Importing the vendor registers MultiModalityCausalLM with Transformers.
         from transformers import AutoModelForCausalLM
+
+        from .vendor.models import MultiModalityCausalLM, VLChatProcessor
 
         path = config.pretrained_model_ckpt_path
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -61,22 +60,16 @@ class JanusProBundle(Bundle):
 
         processor = VLChatProcessor.from_pretrained(path)
         tokenizer = processor.tokenizer
-        if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
-            tokenizer.pad_token = tokenizer.eos_token
+        if processor.pad_id is None:
+            raise ValueError(f"JanusProBundle: {path} tokenizer is missing the Janus pad token.")
 
-        model = AutoModelForCausalLM.from_pretrained(
-            path,
-            trust_remote_code=config.trust_remote_code,
-            torch_dtype=dtype,
-        ).to(device=device, dtype=dtype)
-        # Keep this as a backstop for explicit trust_remote_code overrides: remote
-        # modeling code must not silently replace the reviewed vendored runtime.
+        model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=dtype).to(device=device, dtype=dtype)
         if not isinstance(model, MultiModalityCausalLM):
             raise TypeError(
                 f"JanusProBundle: {path} resolved to {type(model).__module__}.{type(model).__name__}, "
-                "not the vendored MultiModalityCausalLM. Re-vendor the checkpoint's modeling code "
-                "instead of enabling an unreviewed remote implementation."
+                "not the vendored MultiModalityCausalLM."
             )
+        # The train stack toggles only language_model; frozen sibling towers stay in eval mode.
         model.eval()
 
         # Janus stages call the replicated embedding/norm/head children directly,
@@ -99,22 +92,14 @@ class JanusProBundle(Bundle):
                 len(decoder_blocks),
             )
 
-        # JanusProPipelineConfig rejects unsupported unfreezing, so these towers
-        # are unconditional rather than re-testing validated flags.
         model.vision_model.requires_grad_(False)
         model.aligner.requires_grad_(False)
-        for name in ("gen_vision_model", "gen_aligner", "gen_head", "gen_embed"):
-            getattr(model, name).requires_grad_(False)
+        for module in (model.gen_vision_model, model.gen_aligner, model.gen_head, model.gen_embed):
+            module.requires_grad_(False)
         logger.info("Froze Janus-Pro vision, understanding-aligner, and image-generation towers.")
 
         if config.use_gradient_checkpointing:
-            lm = getattr(model, "language_model", None)
-            if hasattr(lm, "gradient_checkpointing_enable"):
-                lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-            elif hasattr(model, "gradient_checkpointing_enable"):
-                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-            else:
-                logger.warning("Janus-Pro model does not expose gradient_checkpointing_enable; skipping.")
+            model.language_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         return cls(
             model=model,
@@ -123,23 +108,10 @@ class JanusProBundle(Bundle):
             dtype=dtype,
             device=device,
             pretrained_path=path,
+            pad_token_id=processor.pad_id,
+            cache_vision_embeddings=config.cache_vision_embeddings,
+            rollout_keep_params_unsharded=config.rollout_keep_params_unsharded,
         )
-
-    def trainable_module(self) -> nn.Module:
-        return self.transformer
-
-    @property
-    def pad_token_id(self) -> int:
-        pad_id = getattr(self.processor, "pad_id", None)
-        if pad_id is not None:
-            return int(pad_id)
-        tok_pad = getattr(self.tokenizer, "pad_token_id", None)
-        if tok_pad is not None:
-            return int(tok_pad)
-        eos = getattr(self.tokenizer, "eos_token_id", None)
-        if eos is not None:
-            return int(eos)
-        return 0
 
 
 __all__ = ["JanusProBundle"]

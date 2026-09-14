@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import ClassVar, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -14,17 +13,24 @@ from unirl.utils.dtypes import parse_torch_dtype
 
 from .ar import (
     JanusProARStep,
-    _language_body,
+    _autocast_ctx,
+    _decode_attention_state,
+    _keep_fsdp_params_unsharded,
     _left_repack_token_condition,
     _position_ids_from_attention_mask,
+    _replay_temperature,
 )
 from .bundle import JanusProBundle
 from .conditions import JanusProImageARConditions, _finite_cfg_weight
+
+_VQ_SPATIAL_FACTOR = 16
 
 
 @dataclass
 class JanusProImageARSamplingParams(ARSamplingParams):
     """Sampling parameters for Janus-Pro autoregressive image tokens."""
+
+    emits_fixed_length: ClassVar[bool] = True
 
     temperature: float = 1.0
     max_new_tokens: int = 576
@@ -34,7 +40,6 @@ class JanusProImageARSamplingParams(ARSamplingParams):
     img_size: int = 384
     width: Optional[int] = None
     height: Optional[int] = None
-    patch_size: int = 16
 
     def __post_init__(self) -> None:
         self.cfg_weight = _finite_cfg_weight(
@@ -42,47 +47,31 @@ class JanusProImageARSamplingParams(ARSamplingParams):
             where="JanusProImageARSamplingParams.cfg_weight",
         )
 
-    @property
-    def emits_fixed_length(self) -> bool:
-        """Return true because image generation emits exactly one token per VQ grid cell."""
-        return True
 
-
-def _resolve_image_grid(params: ARSamplingParams) -> Tuple[int, int, int, int]:
+def _resolve_image_grid(params: ARSamplingParams) -> Tuple[int, int, int]:
     if not isinstance(params, JanusProImageARSamplingParams):
         raise TypeError(
             f"Janus-Pro image generation requires JanusProImageARSamplingParams; got {type(params).__name__}."
         )
     width = params.width
     height = params.height
-    img_size = int(params.img_size)
-    width = img_size if width is None else int(width)
-    height = img_size if height is None else int(height)
-    patch_size = int(params.patch_size)
-    if width <= 0 or height <= 0 or patch_size <= 0:
+    width = params.img_size if width is None else width
+    height = params.img_size if height is None else height
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Janus-Pro image dimensions must be positive; got width={width}, height={height}.")
+    if width % _VQ_SPATIAL_FACTOR != 0 or height % _VQ_SPATIAL_FACTOR != 0:
         raise ValueError(
-            "JanusProImageARSamplingParams requires positive width, height, and patch_size; "
-            f"got width={width}, height={height}, patch_size={patch_size}."
+            f"Janus-Pro image dimensions must be divisible by {_VQ_SPATIAL_FACTOR}; got width={width}, height={height}."
         )
-    if patch_size != 16:
-        raise ValueError(
-            f"Janus-Pro's vendored VQ decoder has a fixed 16x spatial factor; patch_size must be 16, got {patch_size}."
-        )
-    if width % patch_size != 0 or height % patch_size != 0:
-        raise ValueError(
-            "Janus-Pro image size must be divisible by patch_size; "
-            f"got width={width}, height={height}, patch_size={patch_size}."
-        )
-    grid_w = width // patch_size
-    grid_h = height // patch_size
+    grid_w = width // _VQ_SPATIAL_FACTOR
+    grid_h = height // _VQ_SPATIAL_FACTOR
     token_count = grid_w * grid_h
-    requested = int(params.max_new_tokens)
-    if requested != token_count:
+    if params.max_new_tokens != token_count:
         raise ValueError(
             "Janus-Pro image token count must match the decode grid: "
-            f"max_new_tokens={requested}, expected {token_count} for {width}x{height} / patch_size={patch_size}."
+            f"max_new_tokens={params.max_new_tokens}, expected {token_count} for {width}x{height}."
         )
-    return width, height, patch_size, token_count
+    return width, height, token_count
 
 
 class JanusProImageARStage(ARStage[JanusProImageARConditions]):
@@ -90,8 +79,8 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
         self,
         *,
         model: JanusProBundle,
-        autocast_precision: str = "bf16",
-        logprob_precision: str = "fp32",
+        autocast_precision: str,
+        logprob_precision: str,
     ) -> None:
         self.model = model
         self.autocast_dtype = parse_torch_dtype(
@@ -109,20 +98,12 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
     def _device(self) -> torch.device:
         return next(self.model.transformer.parameters()).device
 
-    def _autocast_ctx(self, device: torch.device):
-        if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16):
-            return torch.autocast("cuda", self.autocast_dtype)
-        return nullcontext()
-
     def _prepare_paired_prompt_embeds(
         self,
         conditions: JanusProImageARConditions,
         *,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if conditions.prompt is None or conditions.cfg_prompt is None:
-            raise ValueError("JanusProImageARStage requires prompt and cfg_prompt conditions.")
-
         prompt_ids, prompt_mask = _left_repack_token_condition(
             conditions.prompt,
             pad_id=self.model.pad_token_id,
@@ -159,7 +140,7 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
         sampling_params: ARSamplingParams,
         **_kwargs,
     ) -> TextSegment:
-        _width, _height, _patch_size, token_count = _resolve_image_grid(sampling_params)
+        _width, _height, token_count = _resolve_image_grid(sampling_params)
         device = self._device()
         step = JanusProARStep(
             temperature=sampling_params.temperature,
@@ -172,39 +153,46 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
         # sampling_params.cfg_weight into the conditions, so a mismatch here
         # means the two were wired from different places.
         cfg_weight = conditions.cfg_weight
-        sampled_cfg = getattr(sampling_params, "cfg_weight", None)
-        if sampled_cfg is not None and sampled_cfg != cfg_weight:
+        if sampling_params.cfg_weight != cfg_weight:
             raise ValueError(
                 "JanusProImageARStage: sampling_params.cfg_weight="
-                f"{sampled_cfg} disagrees with conditions.cfg_weight={cfg_weight}; "
+                f"{sampling_params.cfg_weight} disagrees with conditions.cfg_weight={cfg_weight}; "
                 "replay can only see the conditions value, so the PPO ratio would be biased."
             )
 
-        with torch.no_grad(), self._autocast_ctx(device):
+        with (
+            torch.no_grad(),
+            _autocast_ctx(device, self.autocast_dtype),
+            _keep_fsdp_params_unsharded(
+                self.model.transformer,
+                enabled=self.model.rollout_keep_params_unsharded,
+            ),
+        ):
             inputs_embeds, attention_mask = self._prepare_paired_prompt_embeds(conditions, device=device)
-            paired_batch = int(inputs_embeds.shape[0])
-            batch_size = paired_batch // 2
-            body = _language_body(self.model.transformer)
+            batch_size = inputs_embeds.shape[0] // 2
+            body = self.model.transformer.model
             past_key_values = None
-            cur_attention_mask = attention_mask
             generated_tokens = torch.empty((batch_size, token_count), dtype=torch.long, device=device)
-            generated_logps = torch.empty((batch_size, token_count), dtype=torch.float32, device=device)
+            generated_logps = torch.empty((batch_size, token_count), dtype=self.logprob_dtype, device=device)
+            full_attention_mask, prompt_position_ids, next_position_ids = _decode_attention_state(
+                attention_mask,
+                token_count,
+            )
+            prompt_length = attention_mask.shape[1]
 
             for i in range(token_count):
                 if i == 0:
-                    position_ids = _position_ids_from_attention_mask(cur_attention_mask)
                     out = body(
                         inputs_embeds=inputs_embeds,
-                        attention_mask=cur_attention_mask,
-                        position_ids=position_ids,
+                        attention_mask=attention_mask,
+                        position_ids=prompt_position_ids,
                         use_cache=True,
                     )
                 else:
-                    position_ids = _position_ids_from_attention_mask(cur_attention_mask)[:, -1:]
                     out = body(
                         inputs_embeds=inputs_embeds,
-                        attention_mask=cur_attention_mask,
-                        position_ids=position_ids,
+                        attention_mask=full_attention_mask[:, : prompt_length + i],
+                        position_ids=next_position_ids + i - 1,
                         past_key_values=past_key_values,
                         use_cache=True,
                     )
@@ -217,13 +205,6 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
 
                 paired_token = torch.stack([token_id, token_id], dim=1).reshape(-1)
                 inputs_embeds = self.model.model.prepare_gen_img_embeds(paired_token).unsqueeze(1)
-                cur_attention_mask = torch.cat(
-                    [
-                        cur_attention_mask,
-                        torch.ones((paired_batch, 1), dtype=cur_attention_mask.dtype, device=device),
-                    ],
-                    dim=1,
-                )
 
         # Cached one-token decode and full-sequence teacher forcing are
         # mathematically equivalent, but bf16 attention kernels use different
@@ -249,9 +230,9 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
 
         device = self._device()
         inputs_embeds, attention_mask = self._prepare_paired_prompt_embeds(conditions, device=device)
-        paired_batch = int(inputs_embeds.shape[0])
+        paired_batch = inputs_embeds.shape[0]
         batch_size = paired_batch // 2
-        lengths = [int(n) for n in segment.lengths.tolist()]
+        lengths = segment.lengths.tolist()
         if batch_size != len(lengths):
             raise ValueError(f"JanusProImageARStage.replay: batch={batch_size} != segment samples={len(lengths)}")
 
@@ -261,7 +242,7 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
 
         response_tokens = torch.zeros((batch_size, t_max), dtype=torch.long, device=device)
         response_mask = torch.zeros((batch_size, t_max), dtype=torch.long, device=device)
-        cu = [int(c) for c in segment.cu_seqlens.tolist()]
+        cu = segment.cu_seqlens.tolist()
         for b, n in enumerate(lengths):
             if n == 0:
                 continue
@@ -269,8 +250,8 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
             response_mask[b, :n] = 1
 
         paired_response_mask = torch.stack([response_mask, response_mask], dim=1).reshape(paired_batch, t_max)
-        with self._autocast_ctx(device):
-            body = _language_body(self.model.transformer)
+        with _autocast_ctx(device, self.autocast_dtype):
+            body = self.model.transformer.model
             paired_response_tokens = torch.stack([response_tokens, response_tokens], dim=1).reshape(
                 paired_batch,
                 t_max,
@@ -293,12 +274,10 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
                 use_cache=False,
             )
 
-            temp = float(temperature)
-            if temp <= 0.0:
-                temp = 1.0
-            prompt_len = int(inputs_embeds.shape[1])
+            temp = _replay_temperature(temperature)
+            prompt_len = inputs_embeds.shape[1]
             prediction_hidden = out.last_hidden_state[:, prompt_len - 1 : prompt_len - 1 + t_max, :]
-            if int(prediction_hidden.shape[1]) != t_max:
+            if prediction_hidden.shape[1] != t_max:
                 raise RuntimeError(
                     "JanusProImageARStage.replay produced too few teacher-forced positions: "
                     f"got {prediction_hidden.shape[1]}, expected {t_max}."
@@ -313,8 +292,6 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
             if n == 0:
                 continue
             flat.append(per_token_logps[b, :n])
-        if not flat:
-            return torch.zeros(0, dtype=self.logprob_dtype, device=device)
         return torch.cat(flat, dim=0).to(dtype=self.logprob_dtype)
 
     def decode(
@@ -326,9 +303,9 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
         if segment.tokens is None or segment.cu_seqlens is None or segment.lengths is None:
             raise ValueError("JanusProImageARStage.decode: segment requires tokens with cu_seqlens")
 
-        width, height, patch_size, token_count = _resolve_image_grid(sampling_params)
+        width, height, token_count = _resolve_image_grid(sampling_params)
         device = self._device()
-        lengths = [int(n) for n in segment.lengths.tolist()]
+        lengths = segment.lengths.tolist()
         if any(n != token_count for n in lengths):
             raise ValueError(
                 "JanusProImageARStage.decode expects fixed-length image token sequences; "
@@ -337,13 +314,13 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
 
         batch_size = len(lengths)
         tokens = torch.empty((batch_size, token_count), dtype=torch.long, device=device)
-        cu = [int(c) for c in segment.cu_seqlens.tolist()]
+        cu = segment.cu_seqlens.tolist()
         for b, n in enumerate(lengths):
             tokens[b, :n] = segment.tokens[cu[b] : cu[b] + n].to(device=device, dtype=torch.long)
 
-        grid_h = height // patch_size
-        grid_w = width // patch_size
-        with torch.no_grad(), self._autocast_ctx(device):
+        grid_h = height // _VQ_SPATIAL_FACTOR
+        grid_w = width // _VQ_SPATIAL_FACTOR
+        with torch.no_grad(), _autocast_ctx(device, self.autocast_dtype):
             decoded = self.model.model.gen_vision_model.decode_code(
                 tokens.to(dtype=torch.int),
                 shape=[batch_size, 8, grid_h, grid_w],
@@ -355,5 +332,4 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
 __all__ = [
     "JanusProImageARSamplingParams",
     "JanusProImageARStage",
-    "_left_repack_token_condition",
 ]

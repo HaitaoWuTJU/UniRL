@@ -39,10 +39,9 @@ bundle:
     model_precision: bf16
     autocast_precision: bf16
     logprob_precision: fp32
-    freeze_vision_tower: true
-    freeze_aligner: true
-    freeze_generation_tower: true
     use_gradient_checkpointing: true
+    cache_vision_embeddings: true  # trade rollout-buffer memory for skipping frozen SigLIP during replay
+    rollout_keep_params_unsharded: true  # 7B H20 smoke passed; avoids per-token FSDP all-gathers
     max_prompt_length: 2048
     use_lora: true
 

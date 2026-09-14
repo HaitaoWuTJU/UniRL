@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Set
 
 from unirl.config.require import require
 
@@ -110,14 +110,11 @@ class DiffusionSamplingParams(BaseSamplingParams):
 class ARSamplingParams(BaseSamplingParams):
     """AR (autoregressive) sampling parameters for LLM-based PE generation."""
 
+    emits_fixed_length: ClassVar[bool] = False
+
     temperature: float = 0.7
     max_new_tokens: int = 512
     top_p: float = 0.9
     top_k: int = 0
     stop_token_id: int | None = None
     seed: Optional[int] = None  # engines with per-request seeded sampling derive child seeds from this + sample_id
-
-    @property
-    def emits_fixed_length(self) -> bool:
-        """Return whether ``max_new_tokens`` is an exact length rather than a cap."""
-        return False
